@@ -4,26 +4,20 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"os"
-	"os/signal"
-	"syscall"
 
 	cache "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 
 	discoveryservice "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
-
-	// To avoid any issue when parsing HttpGrpcAccessLogConfig
-	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/access_loggers/grpc/v3"
-	// To avoid any issue when parsing inline Lua scripts.
-	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/lua/v3"
 	serverv3 "github.com/envoyproxy/go-control-plane/pkg/server/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 
 	// Loading these triggers the population of protoregistry via their inits.
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/access_loggers/grpc/v3"
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/cors/v3"
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_authz/v3"
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/jwt_authn/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/lua/v3"
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/listener/tls_inspector/v3"
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
@@ -32,9 +26,10 @@ import (
 // Run entry point for Envoy XDS command line.
 func Run() error {
 
-	callbacks := serverv3.CallbackFuncs{}
 	snapshotCache := cache.NewSnapshotCache(true, cache.IDHash{}, log)
-	server := serverv3.NewServer(context.Background(), snapshotCache, callbacks)
+	worker := NewWorker(snapshotCache, 5000)
+
+	server := serverv3.NewServer(context.Background(), snapshotCache, worker)
 	grpcServer := grpc.NewServer()
 	reflection.Register(grpcServer)
 	lis, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", config.Port))
@@ -50,13 +45,11 @@ func Run() error {
 		}
 	}()
 
-	var gracefulStop = make(chan os.Signal)
-	signal.Notify(gracefulStop, syscall.SIGTERM)
-	signal.Notify(gracefulStop, syscall.SIGINT)
-
+	worker.Start(context.Background())
 	log.Infof("Listening on %d", config.Port)
-	sig := <-gracefulStop
-	log.Debugf("Got signal: %s", sig)
+
+	menu(worker)
+
 	grpcServer.GracefulStop()
 	log.Info("Shutdown")
 	return nil
