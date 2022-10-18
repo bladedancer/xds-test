@@ -37,6 +37,15 @@ func menu(worker *Worker) {
 		return fuzzy.MatchFold(input, menuItems[index].label)
 	}
 
+	getMenuItem := func(label string) *MenuItem {
+		for _, menuItem := range menuItems {
+			if menuItem.label == label {
+				return menuItem
+			}
+		}
+		return nil
+	}
+
 	for cont {
 		prompt := promptui.Select{
 			Label:    "Select Action",
@@ -51,13 +60,8 @@ func menu(worker *Worker) {
 			return
 		}
 
-		switch result {
-		case "Update Listener":
-			log.Info("Updating Listener")
-			worker.UpdateListener()
-		case "Quit":
-			log.Info("Quiting")
-			return
-		}
+		selection := getMenuItem(result)
+		log.Info(selection.confirmation)
+		selection.action()
 	}
 }
