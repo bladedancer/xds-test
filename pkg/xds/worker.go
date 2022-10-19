@@ -305,7 +305,8 @@ func (w *Worker) UpdateRoute(name string, prefix string, cluster string) {
 func (w *Worker) updateRouteConfiguration() {
 	// Quick and dirty as with lds we'll only have one
 	routecfg := &route.RouteConfiguration{
-		Name: "xdstest",
+		Name:             "xdstest",
+		ValidateClusters: &wrapperspb.BoolValue{Value: true},
 		VirtualHosts: []*route.VirtualHost{
 			{
 				Name:    "localhost",
