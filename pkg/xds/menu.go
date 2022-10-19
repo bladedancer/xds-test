@@ -251,7 +251,7 @@ func updateRoute(worker *Worker) {
 		return
 	}
 
-	worker.AddRoute(name, prefix, cluster)
+	worker.UpdateRoute(name, prefix, cluster)
 }
 
 func menu(worker *Worker) {

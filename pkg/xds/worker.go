@@ -256,6 +256,7 @@ func (w *Worker) newCluster(name string, host string, port uint32) *cluster.Clus
 		ClusterDiscoveryType: &cluster.Cluster_Type{
 			Type: cluster.Cluster_STRICT_DNS,
 		},
+		DnsLookupFamily: cluster.Cluster_V4_ONLY,
 		LoadAssignment: &endpoint.ClusterLoadAssignment{
 			ClusterName: name,
 			Endpoints: []*endpoint.LocalityLbEndpoints{
