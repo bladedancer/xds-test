@@ -1,6 +1,10 @@
 package xds
 
 import (
+	"errors"
+	"fmt"
+	"time"
+
 	"github.com/lithammer/fuzzysearch/fuzzy"
 	"github.com/manifoldco/promptui"
 )
@@ -8,7 +12,100 @@ import (
 type MenuItem struct {
 	label        string
 	confirmation string
-	action       func()
+	action       func(*Worker)
+}
+
+func updateListener(worker *Worker) {
+	worker.UpdateListener()
+}
+
+func addCluster(worker *Worker) {
+	validate := func(input string) error {
+		if len(input) < 3 {
+			return errors.New("Input must have more than 3 characters")
+		}
+		return nil
+	}
+
+	prompt := promptui.Prompt{
+		Label:    "Cluster name",
+		Validate: validate,
+		Default:  fmt.Sprintf("cluster-%d", time.Now().Unix()),
+	}
+
+	name, err := prompt.Run()
+
+	if err != nil {
+		log.Debug(err)
+		log.Info("Cancelled")
+		return
+	}
+
+	prompt = promptui.Prompt{
+		Label:    "Cluster Host",
+		Validate: validate,
+		Default:  "localhost",
+	}
+
+	host, err := prompt.Run()
+
+	if err != nil {
+		log.Debug(err)
+		log.Info("Cancelled")
+		return
+	}
+
+	worker.AddCluster(name, host)
+}
+
+func updateCluster(worker *Worker) {
+	validate := func(input string) error {
+		if len(input) < 3 {
+			return errors.New("Input must have more than 3 characters")
+		}
+		return nil
+	}
+
+	clusterNames := worker.GetClusterNames()
+
+	if len(clusterNames) == 0 {
+		log.Info("No clusters to update")
+		return
+	}
+	search := func(input string, index int) bool {
+		return fuzzy.MatchFold(input, clusterNames[index])
+	}
+
+	selecter := promptui.Select{
+		Label:    "Select Cluster",
+		Items:    clusterNames,
+		Searcher: search,
+	}
+
+	_, name, err := selecter.Run()
+
+	if err != nil {
+		log.Debug(err)
+		log.Info("Cancelled")
+		return
+	}
+
+	hostname := worker.GetClusterHostname(name)
+	prompt := promptui.Prompt{
+		Label:    "Cluster Host",
+		Validate: validate,
+		Default:  hostname,
+	}
+
+	host, err := prompt.Run()
+
+	if err != nil {
+		log.Debug(err)
+		log.Info("Cancelled")
+		return
+	}
+
+	worker.UpdateCluster(name, host)
 }
 
 func menu(worker *Worker) {
@@ -17,12 +114,22 @@ func menu(worker *Worker) {
 		{
 			label:        "Update Listener",
 			confirmation: "Updating Listener",
-			action:       worker.UpdateListener,
+			action:       updateListener,
+		},
+		{
+			label:        "Add Cluster",
+			confirmation: "Adding Cluster",
+			action:       addCluster,
+		},
+		{
+			label:        "Update Cluster",
+			confirmation: "Updating Cluster",
+			action:       updateCluster,
 		},
 		{
 			label:        "Quit",
 			confirmation: "Quiting",
-			action:       func() { cont = false },
+			action:       func(w *Worker) { cont = false },
 		},
 	}
 
@@ -32,8 +139,6 @@ func menu(worker *Worker) {
 	}
 
 	search := func(input string, index int) bool {
-		log.Info(input)
-		log.Info(index)
 		return fuzzy.MatchFold(input, menuItems[index].label)
 	}
 
@@ -62,6 +167,6 @@ func menu(worker *Worker) {
 
 		selection := getMenuItem(result)
 		log.Info(selection.confirmation)
-		selection.action()
+		selection.action(worker)
 	}
 }

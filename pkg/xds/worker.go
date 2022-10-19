@@ -7,21 +7,25 @@ import (
 
 	router "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
 
-	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	http_conn "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 
 	"github.com/envoyproxy/go-control-plane/pkg/cache/types"
 	"github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/resource/v3"
-	serverv3 "github.com/envoyproxy/go-control-plane/pkg/server/v3"
+	server "github.com/envoyproxy/go-control-plane/pkg/server/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
 )
 
 type Worker struct {
-	serverv3.CallbackFuncs
+	server.CallbackFuncs
 
 	snapshotCache cache.SnapshotCache
 
@@ -42,7 +46,43 @@ func NewWorker(snapshotCache cache.SnapshotCache, updateInterval uint) *Worker {
 		snapshotCache:  snapshotCache,
 		updateInterval: updateInterval,
 		curPort:        42420,
+
+		endpoints: []types.Resource{},
+		clusters:  []types.Resource{},
+		routes:    []types.Resource{},
+		listeners: []types.Resource{},
+		secrets:   []types.Resource{},
+		dirty:     true,
+
+		CallbackFuncs: server.CallbackFuncs{
+			DeltaStreamOpenFunc:     deltaStreamOpenFunc,
+			DeltaStreamClosedFunc:   deltaStreamClosedFunc,
+			StreamDeltaRequestFunc:  streamDeltaRequestFunc,
+			StreamDeltaResponseFunc: streamDeltaResponseFunc,
+		},
 	}
+
+}
+
+func deltaStreamOpenFunc(ctx context.Context, i int64, s string) error {
+	log.Infof("deltaStreamOpenFunc %d %s", i, s)
+	return nil
+}
+
+func deltaStreamClosedFunc(i int64) {
+	log.Infof("deltaStreamClosedFunc %d", i)
+}
+
+func streamDeltaRequestFunc(i int64, req *discovery.DeltaDiscoveryRequest) error {
+	if req.ErrorDetail != nil {
+		log.Errorf("%+v", req.ErrorDetail)
+	}
+	log.Infof("streamDeltaRequestFunc %d %s", i, req.TypeUrl)
+	return nil
+}
+
+func streamDeltaResponseFunc(i int64, req *discovery.DeltaDiscoveryRequest, resp *discovery.DeltaDiscoveryResponse) {
+	log.Infof("streamDeltaResponseFunc %d %s %d", i, req.TypeUrl, len(resp.Resources))
 }
 
 func (w *Worker) Start(ctx context.Context) {
@@ -97,8 +137,8 @@ func (w *Worker) UpdateListener() {
 func (w *Worker) newListener() *listener.Listener {
 	routerFilterConfig, _ := anypb.New(&router.Router{})
 	hcmConfig, err := anypb.New(&http_conn.HttpConnectionManager{
-		CommonHttpProtocolOptions: &corev3.HttpProtocolOptions{},
-		Http2ProtocolOptions:      &corev3.Http2ProtocolOptions{},
+		CommonHttpProtocolOptions: &core.HttpProtocolOptions{},
+		Http2ProtocolOptions:      &core.Http2ProtocolOptions{},
 		InternalAddressConfig:     &http_conn.HttpConnectionManager_InternalAddressConfig{},
 		StatPrefix:                "xdstest",
 		HttpFilters: []*http_conn.HttpFilter{
@@ -112,9 +152,9 @@ func (w *Worker) newListener() *listener.Listener {
 		RouteSpecifier: &http_conn.HttpConnectionManager_Rds{
 			Rds: &http_conn.Rds{
 				RouteConfigName: "xdstest",
-				ConfigSource: &corev3.ConfigSource{
-					ResourceApiVersion:    corev3.ApiVersion_V3,
-					ConfigSourceSpecifier: &corev3.ConfigSource_Ads{},
+				ConfigSource: &core.ConfigSource{
+					ResourceApiVersion:    core.ApiVersion_V3,
+					ConfigSourceSpecifier: &core.ConfigSource_Ads{},
 				},
 			},
 		},
@@ -127,12 +167,12 @@ func (w *Worker) newListener() *listener.Listener {
 	// Listener
 	return &listener.Listener{
 		Name: "amplify",
-		Address: &corev3.Address{
-			Address: &corev3.Address_SocketAddress{
-				SocketAddress: &corev3.SocketAddress{
+		Address: &core.Address{
+			Address: &core.Address_SocketAddress{
+				SocketAddress: &core.SocketAddress{
 					Address:  "0.0.0.0",
-					Protocol: corev3.SocketAddress_TCP,
-					PortSpecifier: &corev3.SocketAddress_PortValue{
+					Protocol: core.SocketAddress_TCP,
+					PortSpecifier: &core.SocketAddress_PortValue{
 						PortValue: uint32(w.curPort),
 					},
 				},
@@ -145,6 +185,74 @@ func (w *Worker) newListener() *listener.Listener {
 						Name: "envoy.filters.network.http_connection_manager",
 						ConfigType: &listener.Filter_TypedConfig{
 							TypedConfig: hcmConfig,
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func (w *Worker) GetClusterNames() []string {
+	names := []string{}
+	for _, resource := range w.clusters {
+		names = append(names, resource.(*cluster.Cluster).Name)
+	}
+	return names
+}
+
+func (w *Worker) GetClusterHostname(name string) string {
+	for _, resource := range w.clusters {
+		clst := resource.(*cluster.Cluster)
+		if clst.Name == name {
+			return clst.LoadAssignment.Endpoints[0].LbEndpoints[0].HostIdentifier.(*endpoint.LbEndpoint_Endpoint).Endpoint.Address.Address.(*core.Address_SocketAddress).SocketAddress.Address
+		}
+	}
+	return ""
+}
+
+func (w *Worker) AddCluster(name string, host string) {
+	w.clusters = append(w.clusters, w.newCluster(name, host))
+	w.dirty = true
+}
+
+func (w *Worker) UpdateCluster(name string, host string) {
+	for _, resource := range w.clusters {
+		clst := resource.(*cluster.Cluster)
+		if clst.Name == name {
+			clst.LoadAssignment.Endpoints[0].LbEndpoints[0].HostIdentifier.(*endpoint.LbEndpoint_Endpoint).Endpoint.Address.Address.(*core.Address_SocketAddress).SocketAddress.Address = host
+			w.dirty = true
+			break
+		}
+	}
+}
+
+func (w *Worker) newCluster(name string, host string) *cluster.Cluster {
+	return &cluster.Cluster{
+		Name:              name,
+		WaitForWarmOnInit: &wrapperspb.BoolValue{Value: true},
+		ClusterDiscoveryType: &cluster.Cluster_Type{
+			Type: cluster.Cluster_STRICT_DNS,
+		},
+		LoadAssignment: &endpoint.ClusterLoadAssignment{
+			ClusterName: name,
+			Endpoints: []*endpoint.LocalityLbEndpoints{
+				{
+					LbEndpoints: []*endpoint.LbEndpoint{
+						{
+							HostIdentifier: &endpoint.LbEndpoint_Endpoint{
+								Endpoint: &endpoint.Endpoint{
+									Address: &core.Address{
+										Address: &core.Address_SocketAddress{
+											SocketAddress: &core.SocketAddress{
+												Address:       host,
+												PortSpecifier: &core.SocketAddress_PortValue{PortValue: 8080},
+												Protocol:      core.SocketAddress_TCP,
+											},
+										},
+									},
+								},
+							},
 						},
 					},
 				},
