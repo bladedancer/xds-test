@@ -11,6 +11,7 @@ import (
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -35,6 +36,8 @@ type Worker struct {
 	listeners []types.Resource
 	secrets   []types.Resource
 
+	routeDetails []*route.Route // Keeping this separate to the route config
+
 	updateInterval uint
 	curPort        uint
 	version        string
@@ -54,6 +57,8 @@ func NewWorker(snapshotCache cache.SnapshotCache, updateInterval uint) *Worker {
 		secrets:   []types.Resource{},
 		dirty:     true,
 
+		routeDetails: []*route.Route{},
+
 		CallbackFuncs: server.CallbackFuncs{
 			DeltaStreamOpenFunc:     deltaStreamOpenFunc,
 			DeltaStreamClosedFunc:   deltaStreamClosedFunc,
@@ -61,7 +66,6 @@ func NewWorker(snapshotCache cache.SnapshotCache, updateInterval uint) *Worker {
 			StreamDeltaResponseFunc: streamDeltaResponseFunc,
 		},
 	}
-
 }
 
 func deltaStreamOpenFunc(ctx context.Context, i int64, s string) error {
@@ -105,7 +109,6 @@ func (w *Worker) work(ctx context.Context) {
 		return
 	}
 
-	// Update the snapshot SEEMS DODGY PROBABLY SHOULD BE UPDATING RESOURCES
 	snapshot, err := cache.NewSnapshot(w.version,
 		map[string][]types.Resource{
 			resource.EndpointType: w.endpoints,
@@ -201,33 +204,52 @@ func (w *Worker) GetClusterNames() []string {
 	return names
 }
 
-func (w *Worker) GetClusterHostname(name string) string {
+func (w *Worker) GetClusterDetails(name string) (string, uint32) {
 	for _, resource := range w.clusters {
 		clst := resource.(*cluster.Cluster)
 		if clst.Name == name {
-			return clst.LoadAssignment.Endpoints[0].LbEndpoints[0].HostIdentifier.(*endpoint.LbEndpoint_Endpoint).Endpoint.Address.Address.(*core.Address_SocketAddress).SocketAddress.Address
+			return clst.LoadAssignment.Endpoints[0].LbEndpoints[0].HostIdentifier.(*endpoint.LbEndpoint_Endpoint).Endpoint.Address.Address.(*core.Address_SocketAddress).SocketAddress.Address,
+				clst.LoadAssignment.Endpoints[0].LbEndpoints[0].HostIdentifier.(*endpoint.LbEndpoint_Endpoint).Endpoint.Address.Address.(*core.Address_SocketAddress).SocketAddress.PortSpecifier.(*core.SocketAddress_PortValue).PortValue
 		}
 	}
-	return ""
+	return "", 0
 }
 
-func (w *Worker) AddCluster(name string, host string) {
-	w.clusters = append(w.clusters, w.newCluster(name, host))
+func (w *Worker) GetRouteNames() []string {
+	names := []string{}
+	for _, route := range w.routeDetails {
+		names = append(names, route.Name)
+	}
+	return names
+}
+
+func (w *Worker) GetRouteDetails(name string) (string, string) {
+	for _, r := range w.routeDetails {
+		if r.Name == name {
+			return r.Match.GetPrefix(), r.Action.(*route.Route_Route).Route.ClusterSpecifier.(*route.RouteAction_Cluster).Cluster
+		}
+	}
+	return "", ""
+}
+
+func (w *Worker) AddCluster(name string, host string, port uint32) {
+	w.clusters = append(w.clusters, w.newCluster(name, host, port))
 	w.dirty = true
 }
 
-func (w *Worker) UpdateCluster(name string, host string) {
+func (w *Worker) UpdateCluster(name string, host string, port uint32) {
 	for _, resource := range w.clusters {
 		clst := resource.(*cluster.Cluster)
 		if clst.Name == name {
 			clst.LoadAssignment.Endpoints[0].LbEndpoints[0].HostIdentifier.(*endpoint.LbEndpoint_Endpoint).Endpoint.Address.Address.(*core.Address_SocketAddress).SocketAddress.Address = host
+			clst.LoadAssignment.Endpoints[0].LbEndpoints[0].HostIdentifier.(*endpoint.LbEndpoint_Endpoint).Endpoint.Address.Address.(*core.Address_SocketAddress).SocketAddress.PortSpecifier = &core.SocketAddress_PortValue{PortValue: port}
 			w.dirty = true
 			break
 		}
 	}
 }
 
-func (w *Worker) newCluster(name string, host string) *cluster.Cluster {
+func (w *Worker) newCluster(name string, host string, port uint32) *cluster.Cluster {
 	return &cluster.Cluster{
 		Name:              name,
 		WaitForWarmOnInit: &wrapperspb.BoolValue{Value: true},
@@ -246,7 +268,7 @@ func (w *Worker) newCluster(name string, host string) *cluster.Cluster {
 										Address: &core.Address_SocketAddress{
 											SocketAddress: &core.SocketAddress{
 												Address:       host,
-												PortSpecifier: &core.SocketAddress_PortValue{PortValue: 8080},
+												PortSpecifier: &core.SocketAddress_PortValue{PortValue: port},
 												Protocol:      core.SocketAddress_TCP,
 											},
 										},
@@ -255,6 +277,58 @@ func (w *Worker) newCluster(name string, host string) *cluster.Cluster {
 							},
 						},
 					},
+				},
+			},
+		},
+	}
+}
+
+func (w *Worker) AddRoute(name string, prefix string, cluster string) {
+	w.routeDetails = append(w.routeDetails, w.newRoute(name, prefix, cluster))
+	w.updateRouteConfiguration()
+	w.dirty = true
+}
+
+func (w *Worker) UpdateRoute(name string, prefix string, cluster string) {
+	for _, r := range w.routeDetails {
+		if r.Name == name {
+			r.Match.PathSpecifier.(*route.RouteMatch_Prefix).Prefix = prefix
+			r.Action.(*route.Route_Route).Route.ClusterSpecifier.(*route.RouteAction_Cluster).Cluster = cluster
+			break
+		}
+	}
+	w.updateRouteConfiguration()
+	w.dirty = true
+}
+
+func (w *Worker) updateRouteConfiguration() {
+	// Quick and dirty as with lds we'll only have one
+	routecfg := &route.RouteConfiguration{
+		Name: "xdstest",
+		VirtualHosts: []*route.VirtualHost{
+			{
+				Name:    "localhost",
+				Domains: []string{"*"},
+				Routes:  w.routeDetails,
+			},
+		},
+	}
+	w.routes = []types.Resource{routecfg}
+}
+
+func (w *Worker) newRoute(name string, prefix string, cluster string) *route.Route {
+	return &route.Route{
+		Name: name,
+		Match: &route.RouteMatch{
+			PathSpecifier: &route.RouteMatch_Prefix{
+				Prefix: prefix,
+			},
+		},
+		Action: &route.Route_Route{
+			Route: &route.RouteAction{
+				HostRewriteSpecifier: &route.RouteAction_AutoHostRewrite{AutoHostRewrite: &wrapperspb.BoolValue{Value: true}},
+				ClusterSpecifier: &route.RouteAction_Cluster{
+					Cluster: cluster,
 				},
 			},
 		},
