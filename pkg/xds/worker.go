@@ -10,8 +10,11 @@ import (
 	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
+
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	tls_inspector "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/listener/tls_inspector/v3"
+	secret "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -39,7 +42,6 @@ type Worker struct {
 	routeDetails []*route.Route // Keeping this separate to the route config
 
 	updateInterval uint
-	curPort        uint
 	version        string
 	dirty          bool // This is just because I don't want to track versions per resource yet.
 }
@@ -48,7 +50,6 @@ func NewWorker(snapshotCache cache.SnapshotCache, updateInterval uint) *Worker {
 	return &Worker{
 		snapshotCache:  snapshotCache,
 		updateInterval: updateInterval,
-		curPort:        42420,
 
 		endpoints: []types.Resource{},
 		clusters:  []types.Resource{},
@@ -108,7 +109,7 @@ func (w *Worker) work(ctx context.Context) {
 		// No changes posted so don't update
 		return
 	}
-
+	w.version = fmt.Sprintf("%d", time.Now().UnixNano())
 	snapshot, err := cache.NewSnapshot(w.version,
 		map[string][]types.Resource{
 			resource.EndpointType: w.endpoints,
@@ -129,21 +130,65 @@ func (w *Worker) work(ctx context.Context) {
 	w.dirty = false
 }
 
-func (w *Worker) UpdateListener() {
-	w.version = fmt.Sprintf("%d", time.Now().UnixNano())
-
-	w.curPort += 1
-	w.listeners = []types.Resource{w.newListener()}
+func (w *Worker) AddListener(name string, port uint32, secret string, servernames []string) {
+	w.listeners = append(w.listeners, w.newListener(name, port, secret, servernames))
 	w.dirty = true
 }
 
-func (w *Worker) newListener() *listener.Listener {
+func (w *Worker) AddListenerFilterChain(name string, secret string, servernames []string) {
+	for _, resource := range w.listeners {
+		lsnr := resource.(*listener.Listener)
+		if lsnr.Name == name {
+			chain := w.newFilterChain("xdstest", secret, servernames)
+			lsnr.FilterChains = append(lsnr.FilterChains, chain)
+			break
+		}
+	}
+}
+
+func (w *Worker) GetListenerNames() []string {
+	names := []string{}
+	for _, resource := range w.listeners {
+		names = append(names, resource.(*listener.Listener).Name)
+	}
+	return names
+}
+
+func (w *Worker) newListener(name string, port uint32, secretName string, servernames []string) *listener.Listener {
+	tlsInspectorConfig, _ := anypb.New(&tls_inspector.TlsInspector{})
+	// Listener
+	return &listener.Listener{
+		Name: "amplify",
+		Address: &core.Address{
+			Address: &core.Address_SocketAddress{
+				SocketAddress: &core.SocketAddress{
+					Address:  "0.0.0.0",
+					Protocol: core.SocketAddress_TCP,
+					PortSpecifier: &core.SocketAddress_PortValue{
+						PortValue: uint32(port),
+					},
+				},
+			},
+		},
+		FilterChains: []*listener.FilterChain{
+			w.newFilterChain("xdstest", secretName, servernames),
+		},
+		ListenerFilters: []*listener.ListenerFilter{
+			{
+				Name:       "envoy.filters.listener.tls_inspector",
+				ConfigType: &listener.ListenerFilter_TypedConfig{TypedConfig: tlsInspectorConfig},
+			},
+		},
+	}
+}
+
+func (w *Worker) newFilterChain(routeCongName string, secretName string, servernames []string) *listener.FilterChain {
 	routerFilterConfig, _ := anypb.New(&router.Router{})
 	hcmConfig, err := anypb.New(&http_conn.HttpConnectionManager{
 		CommonHttpProtocolOptions: &core.HttpProtocolOptions{},
 		Http2ProtocolOptions:      &core.Http2ProtocolOptions{},
 		InternalAddressConfig:     &http_conn.HttpConnectionManager_InternalAddressConfig{},
-		StatPrefix:                "xdstest",
+		StatPrefix:                routeCongName,
 		HttpFilters: []*http_conn.HttpFilter{
 			{
 				Name: wellknown.Router,
@@ -154,7 +199,7 @@ func (w *Worker) newListener() *listener.Listener {
 		},
 		RouteSpecifier: &http_conn.HttpConnectionManager_Rds{
 			Rds: &http_conn.Rds{
-				RouteConfigName: "xdstest",
+				RouteConfigName: routeCongName,
 				ConfigSource: &core.ConfigSource{
 					ResourceApiVersion:    core.ApiVersion_V3,
 					ConfigSourceSpecifier: &core.ConfigSource_Ads{},
@@ -167,33 +212,47 @@ func (w *Worker) newListener() *listener.Listener {
 		log.Fatal(err)
 	}
 
-	// Listener
-	return &listener.Listener{
-		Name: "amplify",
-		Address: &core.Address{
-			Address: &core.Address_SocketAddress{
-				SocketAddress: &core.SocketAddress{
-					Address:  "0.0.0.0",
-					Protocol: core.SocketAddress_TCP,
-					PortSpecifier: &core.SocketAddress_PortValue{
-						PortValue: uint32(w.curPort),
-					},
-				},
-			},
-		},
-		FilterChains: []*listener.FilterChain{
+	filterChain := &listener.FilterChain{
+		Filters: []*listener.Filter{
 			{
-				Filters: []*listener.Filter{
-					{
-						Name: "envoy.filters.network.http_connection_manager",
-						ConfigType: &listener.Filter_TypedConfig{
-							TypedConfig: hcmConfig,
-						},
-					},
+				Name: "envoy.filters.network.http_connection_manager",
+				ConfigType: &listener.Filter_TypedConfig{
+					TypedConfig: hcmConfig,
 				},
 			},
 		},
 	}
+
+	if secretName != "" {
+		downstreamTlsConfig, _ := anypb.New(&secret.DownstreamTlsContext{
+			CommonTlsContext: &secret.CommonTlsContext{
+				TlsCertificateSdsSecretConfigs: []*secret.SdsSecretConfig{
+					&secret.SdsSecretConfig{
+						Name: secretName,
+						SdsConfig: &core.ConfigSource{
+							ResourceApiVersion:    core.ApiVersion_V3,
+							ConfigSourceSpecifier: &core.ConfigSource_Ads{},
+						},
+					},
+				},
+			},
+		})
+
+		filterChain.TransportSocket = &core.TransportSocket{
+			Name: fmt.Sprintf("ts-%d", time.Now().Unix()),
+			ConfigType: &core.TransportSocket_TypedConfig{
+				TypedConfig: downstreamTlsConfig,
+			},
+		}
+	}
+
+	if len(servernames) > 0 {
+		filterChain.FilterChainMatch = &listener.FilterChainMatch{
+			ServerNames: servernames,
+		}
+	}
+
+	return filterChain
 }
 
 func (w *Worker) GetClusterNames() []string {
@@ -305,11 +364,11 @@ func (w *Worker) UpdateRoute(name string, prefix string, cluster string) {
 func (w *Worker) updateRouteConfiguration() {
 	// Quick and dirty as with lds we'll only have one
 	routecfg := &route.RouteConfiguration{
-		Name:             "xdstest",
-		ValidateClusters: &wrapperspb.BoolValue{Value: true},
+		Name: "xdstest",
+		//ValidateClusters: &wrapperspb.BoolValue{Value: true},
 		VirtualHosts: []*route.VirtualHost{
 			{
-				Name:    "localhost",
+				Name:    "star",
 				Domains: []string{"*"},
 				Routes:  w.routeDetails,
 			},
@@ -331,6 +390,81 @@ func (w *Worker) newRoute(name string, prefix string, cluster string) *route.Rou
 				HostRewriteSpecifier: &route.RouteAction_AutoHostRewrite{AutoHostRewrite: &wrapperspb.BoolValue{Value: true}},
 				ClusterSpecifier: &route.RouteAction_Cluster{
 					Cluster: cluster,
+				},
+			},
+		},
+	}
+}
+
+func (w *Worker) AddSecret(name string, keyPath string, certPath string, password string) {
+	w.secrets = append(w.secrets, w.newSecret(name, keyPath, certPath, password))
+	w.dirty = true
+}
+
+func (w *Worker) UpdateSecret(name string, keyPath string, certPath string, password string) {
+	for _, resource := range w.secrets {
+		sec := resource.(*secret.Secret)
+		if sec.Name == name {
+			sec.Type.(*secret.Secret_TlsCertificate).TlsCertificate = &secret.TlsCertificate{
+				CertificateChain: &core.DataSource{
+					Specifier: &core.DataSource_Filename{
+						Filename: certPath,
+					},
+				},
+				PrivateKey: &core.DataSource{
+					Specifier: &core.DataSource_Filename{
+						Filename: keyPath,
+					},
+				},
+				Password: &core.DataSource{
+					Specifier: &core.DataSource_InlineString{
+						InlineString: password,
+					},
+				},
+			}
+			break
+		}
+	}
+	w.dirty = true
+}
+
+func (w *Worker) GetSecretNames() []string {
+	names := []string{}
+	for _, sec := range w.secrets {
+		names = append(names, sec.(*secret.Secret).Name)
+	}
+	return names
+}
+
+func (w *Worker) GetSecretDetails(name string) (string, string, string) {
+	for _, resource := range w.secrets {
+		sec := resource.(*secret.Secret)
+		if sec.Name == name {
+			return sec.GetTlsCertificate().GetPrivateKey().GetFilename(), sec.GetTlsCertificate().GetCertificateChain().GetFilename(), sec.GetTlsCertificate().Password.GetInlineString()
+		}
+	}
+	return "", "", ""
+}
+
+func (w *Worker) newSecret(name string, keyPath string, certPath string, password string) *secret.Secret {
+	return &secret.Secret{
+		Name: name,
+		Type: &secret.Secret_TlsCertificate{
+			TlsCertificate: &secret.TlsCertificate{
+				CertificateChain: &core.DataSource{
+					Specifier: &core.DataSource_Filename{
+						Filename: certPath,
+					},
+				},
+				PrivateKey: &core.DataSource{
+					Specifier: &core.DataSource_Filename{
+						Filename: keyPath,
+					},
+				},
+				Password: &core.DataSource{
+					Specifier: &core.DataSource_InlineString{
+						InlineString: password,
+					},
 				},
 			},
 		},
