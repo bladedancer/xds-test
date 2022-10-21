@@ -15,7 +15,7 @@ import (
 type MenuItem struct {
 	label        string
 	confirmation string
-	action       func(*Worker)
+	action       func(*Worker) error
 }
 
 var validateRequired = func(input string) error {
@@ -67,6 +67,14 @@ func promptString(label string, def string) (string, error) {
 		return "", err
 	}
 	return str, nil
+}
+
+func promptListString(label string, def []string) ([]string, error) {
+	str, err := promptString(label+" (space separated)", strings.Join(def, " "))
+	if err != nil {
+		return nil, err
+	}
+	return strings.Fields(str), nil
 }
 
 func promptFile(label string, def string) (string, error) {
@@ -156,12 +164,13 @@ func promptSecretSelection(worker *Worker) (string, error) {
 	return secret, nil
 }
 
-func selectFromList(label string, items []string, addLabel bool) (string, error) {
-	if addLabel {
+func selectFromList(label string, items []string, addLabel string) (string, error) {
+	if addLabel != "" {
 		selecter := promptui.SelectWithAdd{
 			Label:    label,
 			Items:    items,
-			AddLabel: "Other",
+			AddLabel: addLabel,
+			Validate: validateRequired,
 		}
 
 		_, cluster, err := selecter.Run()
@@ -181,29 +190,23 @@ func selectFromList(label string, items []string, addLabel bool) (string, error)
 	}
 }
 
-func addListener(worker *Worker) {
+func addListener(worker *Worker) error {
 	var err error
 	// Name
 	name, err := promptString("Listener Name", "amplify")
 	if err != nil {
-		log.Debug(err)
-		log.Info("Cancelled")
-		return
+		return err
 	}
 
 	// Port
 	port, err := promptPort("Listener Port", 8080)
 	if err != nil {
-		log.Debug(err)
-		log.Info("Cancelled")
-		return
+		return err
 	}
 
 	useTls, err := promptBool("Use TLS", false)
 	if err != nil {
-		log.Debug(err)
-		log.Info("Cancelled")
-		return
+		return err
 	}
 
 	servername := ""
@@ -211,36 +214,68 @@ func addListener(worker *Worker) {
 	if useTls {
 		servername, err = promptString("Server Name Match", "")
 		if err != nil {
-			log.Debug(err)
-			log.Info("Cancelled")
-			return
+			return err
 		}
 
 		secret, err = promptSecretSelection(worker)
 		if err != nil {
-			log.Debug(err)
-			log.Info("Cancelled")
-			return
+			return err
 		}
 	}
 
-	worker.AddListener(name, port, secret, []string{servername})
+	routeConfigNames := worker.GetRouteConfigurationNames()
+	routeConfigName, err := selectFromList("Select Route Configuration", routeConfigNames, "Route Configuration Name")
+	if err != nil {
+		return err
+	}
+
+	worker.AddListener(name, port, secret, []string{servername}, routeConfigName)
+
+	return nil
 }
 
-func addListenerFilterChain(worker *Worker) {
+func addListenerFilterChain(worker *Worker) error {
 	var err error
 	listenerNames := worker.GetListenerNames()
 	if len(listenerNames) == 0 {
-		log.Info("No listeners to update")
-		return
+		return errors.New("no listeners to update")
 	}
-	name, err := selectFromList("Select Listener", listenerNames, false)
+	name, err := selectFromList("Select Listener", listenerNames, "")
 	if err != nil {
-		log.Debug(err)
-		log.Info("Cancelled")
-		return
+		return err
 	}
 
+	useTls, err := promptBool("Use TLS", false)
+	if err != nil {
+		return err
+	}
+
+	var servernames []string = nil
+	secret := ""
+	if useTls {
+		servernames, err = promptListString("Server Name Match", nil)
+		if err != nil {
+			return err
+		}
+
+		secret, err = promptSecretSelection(worker)
+		if err != nil {
+			return err
+		}
+	}
+
+	routeConfigNames := worker.GetRouteConfigurationNames()
+	routeConfigName, err := selectFromList("Route Configuration", routeConfigNames, "Route Configuration Name")
+	if err != nil {
+		return err
+	}
+
+	worker.AddListenerFilterChain(name, routeConfigName, secret, servernames)
+
+	return nil
+}
+
+func updateListenerFilterChain(worker *Worker, listenerName string, routeConfigName string) {
 	useTls, err := promptBool("Use TLS", false)
 	if err != nil {
 		log.Debug(err)
@@ -248,10 +283,10 @@ func addListenerFilterChain(worker *Worker) {
 		return
 	}
 
-	servername := ""
+	var servernames []string = nil
 	secret := ""
 	if useTls {
-		servername, err = promptString("Server Name Match", "")
+		servernames, err = promptListString("Server Name Match", nil)
 		if err != nil {
 			log.Debug(err)
 			log.Info("Cancelled")
@@ -259,132 +294,122 @@ func addListenerFilterChain(worker *Worker) {
 		}
 
 		secret, err = promptSecretSelection(worker)
+		if err != nil {
+			log.Debug(err)
+			log.Info("Cancelled")
+			return
+		}
 	}
 
-	worker.AddListenerFilterChain(name, secret, []string{servername})
+	worker.AddListenerFilterChain(listenerName, routeConfigName, secret, servernames)
 }
 
-func addCluster(worker *Worker) {
+func addCluster(worker *Worker) error {
 	name, err := promptString("Cluster Name", fmt.Sprintf("cluster-%d", time.Now().Unix()))
 	if err != nil {
-		log.Debug(err)
-		log.Info("Cancelled")
-		return
+		return err
 	}
 
 	host, err := promptString("Cluster Host", "localhost")
 	if err != nil {
-		log.Debug(err)
-		log.Info("Cancelled")
-		return
+		return err
 	}
 
 	port, err := promptPort("Cluster Port", 80)
 	if err != nil {
-		log.Debug(err)
-		log.Info("Cancelled")
-		return
+		return err
 	}
 
 	worker.AddCluster(name, host, port)
+	return nil
 }
 
-func updateCluster(worker *Worker) {
-	clusterNames := worker.GetClusterNames()
-	if len(clusterNames) == 0 {
-		log.Info("No clusters to update")
-		return
-	}
-	name, err := selectFromList("Select Cluster", clusterNames, false)
-	if err != nil {
-		log.Debug(err)
-		log.Info("Cancelled")
-		return
-	}
-
+func updateCluster(worker *Worker, name string) error {
 	hostname, port := worker.GetClusterDetails(name)
-	hostname, err = promptString("Cluster Port", hostname)
+	hostname, err := promptString("Cluster Port", hostname)
 	if err != nil {
-		log.Debug(err)
-		log.Info("Cancelled")
-		return
+		return err
 	}
 
 	port, err = promptPort("Cluster Port", port)
 	if err != nil {
-		log.Debug(err)
-		log.Info("Cancelled")
-		return
+		return err
 	}
 
 	worker.UpdateCluster(name, hostname, port)
+	return nil
 }
 
-func addRoute(worker *Worker) {
+func addRouteConfiguration(worker *Worker) error {
+	name, err := promptString("Route config name", fmt.Sprintf("rc-%d", time.Now().Unix()))
+	if err != nil {
+		return err
+	}
+
+	domains, err := promptListString("Domains", []string{"localhost"})
+	if err != nil {
+		return err
+	}
+
+	worker.AddRouteConfiguration(name, domains)
+	return nil
+}
+
+func updateRouteConfiguration(worker *Worker, name string) error {
+	domains := worker.GetRouteConfigurationDetails(name)
+	domains, err := promptListString("Domains", domains)
+	if err != nil {
+		return err
+	}
+
+	worker.UpdateRouteConfiguration(name, domains)
+	return nil
+}
+
+func addRoute(worker *Worker, routeConfigName string) error {
 	name, err := promptString("Route name", fmt.Sprintf("route-%d", time.Now().Unix()))
 	if err != nil {
-		log.Debug(err)
-		log.Info("Cancelled")
-		return
+		return err
 	}
 
 	prefix, err := promptString("Path Prefix", "/")
 	if err != nil {
-		log.Debug(err)
-		log.Info("Cancelled")
-		return
+		return err
 	}
 
 	clusterNames := worker.GetClusterNames()
-	cluster, err := selectFromList("Select Cluster", clusterNames, true)
+	cluster, err := selectFromList("Select Cluster", clusterNames, "Cluster")
 	if err != nil {
-		log.Debug(err)
-		log.Info("Cancelled")
-		return
+		return err
 	}
 
-	worker.AddRoute(name, prefix, cluster)
+	worker.AddRoute(routeConfigName, name, prefix, cluster)
+	return nil
 }
 
-func updateRoute(worker *Worker) {
-	routeNames := worker.GetRouteNames()
-	if len(routeNames) == 0 {
-		log.Info("No Routes")
-		return
-	}
-	name, err := selectFromList("Select Route", routeNames, false)
+func updateRoute(worker *Worker, routeConfigName string, name string) error {
+	prefix, _ := worker.GetRouteDetails(routeConfigName, name)
+	prefix, err := promptString("Route Prefix", prefix)
 	if err != nil {
-		log.Debug(err)
-		log.Info("Cancelled")
-		return
-	}
-
-	prefix, _ := worker.GetRouteDetails(name)
-	prefix, err = promptString("Route Prefix", prefix)
-	if err != nil {
-		log.Debug(err)
-		log.Info("Cancelled")
-		return
+		return err
 	}
 
 	clusterNames := worker.GetClusterNames()
-	cluster, err := selectFromList("Select Cluster", clusterNames, true)
+	cluster, err := selectFromList("Select Cluster", clusterNames, "Cluster")
 	if err != nil {
-		log.Debug(err)
-		log.Info("Cancelled")
-		return
+		return err
 	}
 
-	worker.UpdateRoute(name, prefix, cluster)
+	worker.UpdateRoute(routeConfigName, name, prefix, cluster)
+	return nil
 }
 
-func addSecret(worker *Worker) {
+func addSecret(worker *Worker) error {
 	_, err := addSecretInternal(worker)
 	if err != nil {
-		log.Debug(err)
-		log.Info("Cancelled")
-		return
+		return err
 	}
+	return nil
 }
 
 func addSecretInternal(worker *Worker) (string, error) {
@@ -410,88 +435,57 @@ func addSecretInternal(worker *Worker) (string, error) {
 	return secret, nil
 }
 
-func updateSecret(worker *Worker) {
-	secrets := worker.GetSecretNames()
-	if len(secrets) == 0 {
-		log.Info("No Secrets")
-		return
-	}
-	name, err := selectFromList("Select secret", secrets, false)
-	if err != nil {
-		log.Debug(err)
-		log.Info("Cancelled")
-		return
-	}
-
+func updateSecret(worker *Worker, name string) error {
 	keyPath, certPath, password := worker.GetSecretDetails(name)
-	keyPath, err = promptFile("Key Path", keyPath)
+	keyPath, err := promptFile("Key Path", keyPath)
 	if err != nil {
-		log.Debug(err)
-		log.Info("Cancelled")
-		return
+		return err
 	}
 	certPath, err = promptFile("Cert Path", certPath)
 	if err != nil {
-		log.Debug(err)
-		log.Info("Cancelled")
-		return
+		return err
 	}
 	password, err = promptOptionalString("Password", password)
 	if err != nil {
-		log.Debug(err)
-		log.Info("Cancelled")
-		return
+		return err
 	}
 	worker.UpdateSecret(name, keyPath, certPath, password)
+
+	return nil
 }
 
-func menu(worker *Worker) {
+func menuMain(worker *Worker) {
 	cont := true
 	menuItems := []*MenuItem{
 		{
-			label:        "Add Listener",
-			confirmation: "Adding Listener",
-			action:       addListener,
+			label:        "Listener",
+			confirmation: "Listener",
+			action:       menuListener,
 		},
 		{
-			label:        "Add Filter Chain",
-			confirmation: "Adding Filter Chin",
-			action:       addListenerFilterChain,
+			label:        "Route Configuration",
+			confirmation: "Route Configuration",
+			action:       menuRouteConfiguration,
 		},
 		{
-			label:        "Add Secret",
-			confirmation: "Adding Secret",
-			action:       addSecret,
+			label:        "Secret",
+			confirmation: "Secret",
+			action:       menuSecret,
 		},
 		{
-			label:        "Update Secret",
-			confirmation: "Updating Secret",
-			action:       updateSecret,
+			label:        "Cluster",
+			confirmation: "Cluster",
+			action:       menuCluster,
 		},
 		{
-			label:        "Add Cluster",
-			confirmation: "Adding Cluster",
-			action:       addCluster,
+			label:        "Route",
+			confirmation: "Route",
+			action:       menuRoute,
 		},
 		{
-			label:        "Update Cluster",
-			confirmation: "Updating Cluster",
-			action:       updateCluster,
-		},
-		{
-			label:        "Add Route",
-			confirmation: "Adding Route",
-			action:       addRoute,
-		},
-		{
-			label:        "Update Route",
-			confirmation: "Updating Route",
-			action:       updateRoute,
-		},
-		{
-			label:        "Quit",
-			confirmation: "Quiting",
-			action:       func(w *Worker) { cont = false },
+			label:        "Deploy",
+			confirmation: "Deploying",
+			action:       func(w *Worker) error { w.MarkDirty(); return nil },
 		},
 	}
 
@@ -530,6 +524,102 @@ func menu(worker *Worker) {
 
 		selection := getMenuItem(result)
 		log.Info(selection.confirmation)
-		selection.action(worker)
+		err = selection.action(worker)
+
+		if err != nil {
+			log.Error(err)
+		}
 	}
+}
+
+type newItemFunc func(*Worker) error
+type editItemFunc func(*Worker, string) error
+
+func menuAddOrEdit(worker *Worker, label string, createLabel string, items []string, newItem newItemFunc, editItem editItemFunc) error {
+	list := append([]string{createLabel}, items...)
+	opt, err := selectFromList(label, list, "")
+	if err != nil {
+		return err
+	}
+
+	if opt == createLabel {
+		err = newItem(worker)
+	} else {
+		err = editItem(worker, opt)
+	}
+
+	return err
+}
+
+func menuListener(worker *Worker) error {
+	return menuAddOrEdit(
+		worker,
+		"Add or Edit Listener",
+		"New Listener",
+		worker.GetListenerNames(),
+		addListener,
+		menuListenerSingle,
+	)
+}
+
+func menuListenerSingle(worker *Worker, listenerName string) error {
+
+	return menuAddOrEdit(
+		worker,
+		"Add or Edit Listener Filter Chain",
+		"New Filter Chain",
+		worker.GetListenerNames(),
+		addListenerFilterChain,
+		func(w *Worker, rcName string) error { updateListenerFilterChain(w, listenerName, rcName); return nil },
+	)
+}
+
+func menuSecret(worker *Worker) error {
+	return menuAddOrEdit(
+		worker,
+		"Add or Edit Secret",
+		"New Secret",
+		worker.GetSecretNames(),
+		addSecret,
+		updateSecret,
+	)
+}
+
+func menuCluster(worker *Worker) error {
+	return menuAddOrEdit(
+		worker,
+		"Add or Edit Cluster",
+		"New Cluster",
+		worker.GetClusterNames(),
+		addCluster,
+		updateCluster,
+	)
+}
+
+func menuRoute(worker *Worker) error {
+	routeConfigNames := worker.GetRouteConfigurationNames()
+	routeConfigName, err := selectFromList("Route Configuration", routeConfigNames, "Route Configuration Name")
+	if err != nil {
+		return err
+	}
+
+	return menuAddOrEdit(
+		worker,
+		"Add or Edit Route",
+		"New Route",
+		worker.GetRouteNames(routeConfigName),
+		func(w *Worker) error { addRoute(w, routeConfigName); return nil },
+		func(w *Worker, name string) error { updateRoute(w, routeConfigName, name); return nil },
+	)
+}
+
+func menuRouteConfiguration(worker *Worker) error {
+	return menuAddOrEdit(
+		worker,
+		"Add or Edit Route Configuration",
+		"New Route Configuration",
+		worker.GetRouteConfigurationNames(),
+		addRouteConfiguration,
+		updateRouteConfiguration,
+	)
 }

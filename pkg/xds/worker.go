@@ -39,7 +39,7 @@ type Worker struct {
 	listeners []types.Resource
 	secrets   []types.Resource
 
-	routeDetails []*route.Route // Keeping this separate to the route config
+	routeDetails map[string][]*route.Route // Keeping this separate to the route config
 
 	updateInterval uint
 	version        string
@@ -58,15 +58,40 @@ func NewWorker(snapshotCache cache.SnapshotCache, updateInterval uint) *Worker {
 		secrets:   []types.Resource{},
 		dirty:     true,
 
-		routeDetails: []*route.Route{},
+		routeDetails: map[string][]*route.Route{},
 
 		CallbackFuncs: server.CallbackFuncs{
 			DeltaStreamOpenFunc:     deltaStreamOpenFunc,
 			DeltaStreamClosedFunc:   deltaStreamClosedFunc,
 			StreamDeltaRequestFunc:  streamDeltaRequestFunc,
 			StreamDeltaResponseFunc: streamDeltaResponseFunc,
+			StreamOpenFunc:          streamOpenFunc,
+			StreamClosedFunc:        streamClosedFunc,
+			StreamRequestFunc:       streamRequestFunc,
+			StreamResponseFunc:      streamResponseFunc,
 		},
 	}
+}
+
+func streamOpenFunc(ctx context.Context, i int64, s string) error {
+	log.Infof("streamOpenFunc %d %s", i, s)
+	return nil
+}
+
+func streamClosedFunc(i int64) {
+	log.Infof("streamClosedFunc %d", i)
+}
+
+func streamRequestFunc(i int64, req *discovery.DiscoveryRequest) error {
+	if req.ErrorDetail != nil {
+		log.Errorf("%+v", req.ErrorDetail)
+	}
+	log.Infof("streamRequestFunc %d %s", i, req.TypeUrl)
+	return nil
+}
+
+func streamResponseFunc(ctx context.Context, i int64, req *discovery.DiscoveryRequest, resp *discovery.DiscoveryResponse) {
+	log.Infof("streamResponseFunc %d %s %d", i, req.TypeUrl, len(resp.Resources))
 }
 
 func deltaStreamOpenFunc(ctx context.Context, i int64, s string) error {
@@ -104,6 +129,10 @@ func (w *Worker) Start(ctx context.Context) {
 	}()
 }
 
+func (w *Worker) MarkDirty() {
+	w.dirty = true
+}
+
 func (w *Worker) work(ctx context.Context) {
 	if !w.dirty {
 		// No changes posted so don't update
@@ -130,17 +159,36 @@ func (w *Worker) work(ctx context.Context) {
 	w.dirty = false
 }
 
-func (w *Worker) AddListener(name string, port uint32, secret string, servernames []string) {
-	w.listeners = append(w.listeners, w.newListener(name, port, secret, servernames))
-	w.dirty = true
+func (w *Worker) AddListener(name string, port uint32, secret string, servernames []string, routeConfigName string) {
+	w.listeners = append(w.listeners, w.newListener(name, port, secret, servernames, routeConfigName))
 }
 
-func (w *Worker) AddListenerFilterChain(name string, secret string, servernames []string) {
+func (w *Worker) AddListenerFilterChain(name string, routeConfigName string, secret string, servernames []string) {
 	for _, resource := range w.listeners {
 		lsnr := resource.(*listener.Listener)
 		if lsnr.Name == name {
-			chain := w.newFilterChain("xdstest", secret, servernames)
+			chain := w.newFilterChain(routeConfigName, secret, servernames)
 			lsnr.FilterChains = append(lsnr.FilterChains, chain)
+			break
+		}
+	}
+}
+
+func (w *Worker) UpdateListenerFilterChain(listenerName string, routeConfigName string, secret string, servernames []string) {
+	for _, resource := range w.listeners {
+		lsnr := resource.(*listener.Listener)
+		if lsnr.Name == listenerName {
+			filterChains := []*listener.FilterChain{}
+
+			for _, fc := range lsnr.GetFilterChains() {
+				if fc.Name == routeConfigName {
+					chain := w.newFilterChain(routeConfigName, secret, servernames)
+					filterChains = append(filterChains, chain)
+				} else {
+					filterChains = append(filterChains, fc)
+				}
+			}
+			lsnr.FilterChains = filterChains
 			break
 		}
 	}
@@ -154,7 +202,7 @@ func (w *Worker) GetListenerNames() []string {
 	return names
 }
 
-func (w *Worker) newListener(name string, port uint32, secretName string, servernames []string) *listener.Listener {
+func (w *Worker) newListener(name string, port uint32, secretName string, servernames []string, routeConfigName string) *listener.Listener {
 	tlsInspectorConfig, _ := anypb.New(&tls_inspector.TlsInspector{})
 	// Listener
 	return &listener.Listener{
@@ -171,7 +219,7 @@ func (w *Worker) newListener(name string, port uint32, secretName string, server
 			},
 		},
 		FilterChains: []*listener.FilterChain{
-			w.newFilterChain("xdstest", secretName, servernames),
+			w.newFilterChain(routeConfigName, secretName, servernames),
 		},
 		ListenerFilters: []*listener.ListenerFilter{
 			{
@@ -189,6 +237,7 @@ func (w *Worker) newFilterChain(routeCongName string, secretName string, servern
 		Http2ProtocolOptions:      &core.Http2ProtocolOptions{},
 		InternalAddressConfig:     &http_conn.HttpConnectionManager_InternalAddressConfig{},
 		StatPrefix:                routeCongName,
+		StripMatchingHostPort:     true,
 		HttpFilters: []*http_conn.HttpFilter{
 			{
 				Name: wellknown.Router,
@@ -227,7 +276,7 @@ func (w *Worker) newFilterChain(routeCongName string, secretName string, servern
 		downstreamTlsConfig, _ := anypb.New(&secret.DownstreamTlsContext{
 			CommonTlsContext: &secret.CommonTlsContext{
 				TlsCertificateSdsSecretConfigs: []*secret.SdsSecretConfig{
-					&secret.SdsSecretConfig{
+					{
 						Name: secretName,
 						SdsConfig: &core.ConfigSource{
 							ResourceApiVersion:    core.ApiVersion_V3,
@@ -246,7 +295,7 @@ func (w *Worker) newFilterChain(routeCongName string, secretName string, servern
 		}
 	}
 
-	if len(servernames) > 0 {
+	if servernames != nil {
 		filterChain.FilterChainMatch = &listener.FilterChainMatch{
 			ServerNames: servernames,
 		}
@@ -274,16 +323,16 @@ func (w *Worker) GetClusterDetails(name string) (string, uint32) {
 	return "", 0
 }
 
-func (w *Worker) GetRouteNames() []string {
+func (w *Worker) GetRouteNames(routeConfigName string) []string {
 	names := []string{}
-	for _, route := range w.routeDetails {
+	for _, route := range w.routeDetails[routeConfigName] {
 		names = append(names, route.Name)
 	}
 	return names
 }
 
-func (w *Worker) GetRouteDetails(name string) (string, string) {
-	for _, r := range w.routeDetails {
+func (w *Worker) GetRouteDetails(routeConfigName string, name string) (string, string) {
+	for _, r := range w.routeDetails[routeConfigName] {
 		if r.Name == name {
 			return r.Match.GetPrefix(), r.Action.(*route.Route_Route).Route.ClusterSpecifier.(*route.RouteAction_Cluster).Cluster
 		}
@@ -293,7 +342,6 @@ func (w *Worker) GetRouteDetails(name string) (string, string) {
 
 func (w *Worker) AddCluster(name string, host string, port uint32) {
 	w.clusters = append(w.clusters, w.newCluster(name, host, port))
-	w.dirty = true
 }
 
 func (w *Worker) UpdateCluster(name string, host string, port uint32) {
@@ -302,7 +350,6 @@ func (w *Worker) UpdateCluster(name string, host string, port uint32) {
 		if clst.Name == name {
 			clst.LoadAssignment.Endpoints[0].LbEndpoints[0].HostIdentifier.(*endpoint.LbEndpoint_Endpoint).Endpoint.Address.Address.(*core.Address_SocketAddress).SocketAddress.Address = host
 			clst.LoadAssignment.Endpoints[0].LbEndpoints[0].HostIdentifier.(*endpoint.LbEndpoint_Endpoint).Endpoint.Address.Address.(*core.Address_SocketAddress).SocketAddress.PortSpecifier = &core.SocketAddress_PortValue{PortValue: port}
-			w.dirty = true
 			break
 		}
 	}
@@ -343,38 +390,85 @@ func (w *Worker) newCluster(name string, host string, port uint32) *cluster.Clus
 	}
 }
 
-func (w *Worker) AddRoute(name string, prefix string, cluster string) {
-	w.routeDetails = append(w.routeDetails, w.newRoute(name, prefix, cluster))
-	w.updateRouteConfiguration()
-	w.dirty = true
+func (w *Worker) AddRoute(routeConfigName string, name string, prefix string, cluster string) {
+	if _, ok := w.routeDetails[routeConfigName]; !ok {
+		w.routeDetails[routeConfigName] = []*route.Route{}
+	}
+	w.routeDetails[routeConfigName] = append(w.routeDetails[routeConfigName], w.newRoute(name, prefix, cluster))
+	w.rebuildRoutes(routeConfigName)
 }
 
-func (w *Worker) UpdateRoute(name string, prefix string, cluster string) {
-	for _, r := range w.routeDetails {
+func (w *Worker) UpdateRoute(routeConfigName string, name string, prefix string, cluster string) {
+	for _, r := range w.routeDetails[routeConfigName] {
 		if r.Name == name {
 			r.Match.PathSpecifier.(*route.RouteMatch_Prefix).Prefix = prefix
 			r.Action.(*route.Route_Route).Route.ClusterSpecifier.(*route.RouteAction_Cluster).Cluster = cluster
 			break
 		}
 	}
-	w.updateRouteConfiguration()
-	w.dirty = true
+	w.rebuildRoutes(routeConfigName)
 }
 
-func (w *Worker) updateRouteConfiguration() {
-	// Quick and dirty as with lds we'll only have one
+func (w *Worker) AddRouteConfiguration(routeConfigName string, domains []string) {
+	if _, ok := w.routeDetails[routeConfigName]; ok {
+		log.Errorf("Route config %s already exists", routeConfigName)
+		return
+	}
+	w.routeDetails[routeConfigName] = []*route.Route{}
+
 	routecfg := &route.RouteConfiguration{
-		Name: "xdstest",
-		//ValidateClusters: &wrapperspb.BoolValue{Value: true},
+		Name:             routeConfigName,
+		ValidateClusters: &wrapperspb.BoolValue{Value: true},
 		VirtualHosts: []*route.VirtualHost{
 			{
-				Name:    "star",
-				Domains: []string{"*"},
-				Routes:  w.routeDetails,
+				Name:    routeConfigName,
+				Domains: domains,
+				Routes:  w.routeDetails[routeConfigName],
 			},
 		},
 	}
-	w.routes = []types.Resource{routecfg}
+	w.routes = append(w.routes, routecfg)
+}
+
+func (w *Worker) UpdateRouteConfiguration(name string, domains []string) {
+	for _, resource := range w.routes {
+		rc := resource.(*route.RouteConfiguration)
+		if rc.Name == name {
+			rc.VirtualHosts[0].Domains = domains
+			break
+		}
+	}
+}
+
+func (w *Worker) GetRouteConfigurationNames() []string {
+	names := []string{}
+	for _, resource := range w.routes {
+		rc := resource.(*route.RouteConfiguration)
+		names = append(names, rc.Name)
+	}
+	return names
+}
+
+func (w *Worker) GetRouteConfigurationDetails(name string) []string {
+	domains := []string{}
+	for _, resource := range w.routes {
+		rc := resource.(*route.RouteConfiguration)
+		if rc.Name == name {
+			domains = rc.VirtualHosts[0].Domains
+			break
+		}
+	}
+	return domains
+}
+
+func (w *Worker) rebuildRoutes(name string) {
+	for _, resource := range w.routes {
+		rc := resource.(*route.RouteConfiguration)
+		if rc.Name == name {
+			rc.VirtualHosts[0].Routes = w.routeDetails[name]
+			break
+		}
+	}
 }
 
 func (w *Worker) newRoute(name string, prefix string, cluster string) *route.Route {
@@ -398,7 +492,6 @@ func (w *Worker) newRoute(name string, prefix string, cluster string) *route.Rou
 
 func (w *Worker) AddSecret(name string, keyPath string, certPath string, password string) {
 	w.secrets = append(w.secrets, w.newSecret(name, keyPath, certPath, password))
-	w.dirty = true
 }
 
 func (w *Worker) UpdateSecret(name string, keyPath string, certPath string, password string) {
@@ -425,7 +518,6 @@ func (w *Worker) UpdateSecret(name string, keyPath string, certPath string, pass
 			break
 		}
 	}
-	w.dirty = true
 }
 
 func (w *Worker) GetSecretNames() []string {

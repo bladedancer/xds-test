@@ -48,7 +48,7 @@ func Run() error {
 	worker.Start(context.Background())
 	log.Infof("Listening on %d", config.Port)
 
-	menu(worker)
+	menuMain(worker)
 
 	grpcServer.GracefulStop()
 	log.Info("Shutdown")
