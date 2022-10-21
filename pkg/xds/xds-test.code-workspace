@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": "../.."
+		},
+		{
+			"path": "../../../../work/go/pkg/mod/github.com/envoyproxy/go-control-plane@v0.10.2-0.20220325020618-49ff273808a1"
+		}
+	],
+	"settings": {}
+}

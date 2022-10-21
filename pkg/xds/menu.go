@@ -126,15 +126,8 @@ func promptSecretSelection(worker *Worker) (string, error) {
 	if len(secretNames) == 0 {
 		action = "New Secret"
 	} else {
-		prompt := promptui.Select{
-			Label: "Select Action",
-			Items: []string{"New Secret", "Existing Secret"},
-			Size:  2,
-		}
-		_, action, err = prompt.Run()
-		if err != nil {
-			return "", err
-		}
+		items := append([]string{"New Secret"}, secretNames...)
+		action, _ = selectFromList("Select Secret", items, "")
 	}
 
 	var secret = ""
@@ -145,20 +138,7 @@ func promptSecretSelection(worker *Worker) (string, error) {
 			return "", err
 		}
 	} else {
-		search := func(input string, index int) bool {
-			return fuzzy.MatchFold(input, secretNames[index])
-		}
-
-		selecter := promptui.Select{
-			Label:    "Select Secret",
-			Items:    secretNames,
-			Searcher: search,
-		}
-
-		_, secret, err = selecter.Run()
-		if err != nil {
-			return "", err
-		}
+		secret = action
 	}
 
 	return secret, nil
@@ -173,8 +153,8 @@ func selectFromList(label string, items []string, addLabel string) (string, erro
 			Validate: validateRequired,
 		}
 
-		_, cluster, err := selecter.Run()
-		return cluster, err
+		_, item, err := selecter.Run()
+		return item, err
 	} else {
 		search := func(input string, index int) bool {
 			return fuzzy.MatchFold(input, items[index])
@@ -185,8 +165,8 @@ func selectFromList(label string, items []string, addLabel string) (string, erro
 			Searcher: search,
 		}
 
-		_, cluster, err := selecter.Run()
-		return cluster, err
+		_, item, err := selecter.Run()
+		return item, err
 	}
 }
 
@@ -234,6 +214,11 @@ func addListener(worker *Worker) error {
 	return nil
 }
 
+func deleteListener(worker *Worker, listenerName string) error {
+	worker.DeleteListener(listenerName)
+	return nil
+}
+
 func addListenerFilterChain(worker *Worker) error {
 	var err error
 	listenerNames := worker.GetListenerNames()
@@ -276,6 +261,7 @@ func addListenerFilterChain(worker *Worker) error {
 }
 
 func updateListenerFilterChain(worker *Worker, listenerName string, routeConfigName string) {
+	// TODO GET EXISTING VALUES
 	useTls, err := promptBool("Use TLS", false)
 	if err != nil {
 		log.Debug(err)
@@ -302,6 +288,10 @@ func updateListenerFilterChain(worker *Worker, listenerName string, routeConfigN
 	}
 
 	worker.AddListenerFilterChain(listenerName, routeConfigName, secret, servernames)
+}
+
+func deleteListenerFilterChain(worker *Worker, listenerName string, routeConfigName string) {
+	worker.DeleteListenerFilterChain(listenerName, routeConfigName)
 }
 
 func addCluster(worker *Worker) error {
@@ -340,6 +330,11 @@ func updateCluster(worker *Worker, name string) error {
 	return nil
 }
 
+func deleteCluster(worker *Worker, name string) error {
+	worker.DeleteCluster(name)
+	return nil
+}
+
 func addRouteConfiguration(worker *Worker) error {
 	name, err := promptString("Route config name", fmt.Sprintf("rc-%d", time.Now().Unix()))
 	if err != nil {
@@ -363,6 +358,11 @@ func updateRouteConfiguration(worker *Worker, name string) error {
 	}
 
 	worker.UpdateRouteConfiguration(name, domains)
+	return nil
+}
+
+func deleteRouteConfiguration(worker *Worker, name string) error {
+	worker.DeleteRouteConfiguration(name)
 	return nil
 }
 
@@ -401,6 +401,11 @@ func updateRoute(worker *Worker, routeConfigName string, name string) error {
 	}
 
 	worker.UpdateRoute(routeConfigName, name, prefix, cluster)
+	return nil
+}
+
+func deleteRoute(worker *Worker, routeConfigName string, name string) error {
+	worker.DeleteRoute(routeConfigName, name)
 	return nil
 }
 
@@ -451,6 +456,11 @@ func updateSecret(worker *Worker, name string) error {
 	}
 	worker.UpdateSecret(name, keyPath, certPath, password)
 
+	return nil
+}
+
+func deleteSecret(worker *Worker, name string) error {
+	worker.DeleteSecret(name)
 	return nil
 }
 
@@ -534,9 +544,13 @@ func menuMain(worker *Worker) {
 
 type newItemFunc func(*Worker) error
 type editItemFunc func(*Worker, string) error
+type deleteItemFunc func(*Worker, string) error
 
-func menuAddOrEdit(worker *Worker, label string, createLabel string, items []string, newItem newItemFunc, editItem editItemFunc) error {
+func menuAddOrEditOrDelete(worker *Worker, label string, createLabel string, items []string, newItem newItemFunc, editItem editItemFunc, deleteItem deleteItemFunc) error {
 	list := append([]string{createLabel}, items...)
+	if len(list) > 1 {
+		list = append(list, "DELETE")
+	}
 	opt, err := selectFromList(label, list, "")
 	if err != nil {
 		return err
@@ -544,6 +558,12 @@ func menuAddOrEdit(worker *Worker, label string, createLabel string, items []str
 
 	if opt == createLabel {
 		err = newItem(worker)
+	} else if opt == "DELETE" {
+		toDelete, err := selectFromList("Delete", items, "")
+		if err != nil {
+			return err
+		}
+		err = deleteItem(worker, toDelete)
 	} else {
 		err = editItem(worker, opt)
 	}
@@ -552,47 +572,51 @@ func menuAddOrEdit(worker *Worker, label string, createLabel string, items []str
 }
 
 func menuListener(worker *Worker) error {
-	return menuAddOrEdit(
+	return menuAddOrEditOrDelete(
 		worker,
 		"Add or Edit Listener",
 		"New Listener",
 		worker.GetListenerNames(),
 		addListener,
 		menuListenerSingle,
+		deleteListener,
 	)
 }
 
 func menuListenerSingle(worker *Worker, listenerName string) error {
 
-	return menuAddOrEdit(
+	return menuAddOrEditOrDelete(
 		worker,
 		"Add or Edit Listener Filter Chain",
 		"New Filter Chain",
 		worker.GetListenerNames(),
 		addListenerFilterChain,
 		func(w *Worker, rcName string) error { updateListenerFilterChain(w, listenerName, rcName); return nil },
+		func(w *Worker, rcName string) error { deleteListenerFilterChain(w, listenerName, rcName); return nil },
 	)
 }
 
 func menuSecret(worker *Worker) error {
-	return menuAddOrEdit(
+	return menuAddOrEditOrDelete(
 		worker,
 		"Add or Edit Secret",
 		"New Secret",
 		worker.GetSecretNames(),
 		addSecret,
 		updateSecret,
+		deleteSecret,
 	)
 }
 
 func menuCluster(worker *Worker) error {
-	return menuAddOrEdit(
+	return menuAddOrEditOrDelete(
 		worker,
 		"Add or Edit Cluster",
 		"New Cluster",
 		worker.GetClusterNames(),
 		addCluster,
 		updateCluster,
+		deleteCluster,
 	)
 }
 
@@ -603,23 +627,25 @@ func menuRoute(worker *Worker) error {
 		return err
 	}
 
-	return menuAddOrEdit(
+	return menuAddOrEditOrDelete(
 		worker,
 		"Add or Edit Route",
 		"New Route",
 		worker.GetRouteNames(routeConfigName),
 		func(w *Worker) error { addRoute(w, routeConfigName); return nil },
 		func(w *Worker, name string) error { updateRoute(w, routeConfigName, name); return nil },
+		func(w *Worker, name string) error { deleteRoute(w, routeConfigName, name); return nil },
 	)
 }
 
 func menuRouteConfiguration(worker *Worker) error {
-	return menuAddOrEdit(
+	return menuAddOrEditOrDelete(
 		worker,
 		"Add or Edit Route Configuration",
 		"New Route Configuration",
 		worker.GetRouteConfigurationNames(),
 		addRouteConfiguration,
 		updateRouteConfiguration,
+		deleteRouteConfiguration,
 	)
 }

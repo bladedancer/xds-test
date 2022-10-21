@@ -163,12 +163,39 @@ func (w *Worker) AddListener(name string, port uint32, secret string, servername
 	w.listeners = append(w.listeners, w.newListener(name, port, secret, servernames, routeConfigName))
 }
 
+func (w *Worker) DeleteListener(name string) {
+	listeners := []types.Resource{}
+	for _, resource := range w.listeners {
+		lsnr := resource.(*listener.Listener)
+		if lsnr.Name != name {
+			listeners = append(listeners, lsnr)
+		}
+	}
+	w.listeners = listeners
+}
+
 func (w *Worker) AddListenerFilterChain(name string, routeConfigName string, secret string, servernames []string) {
 	for _, resource := range w.listeners {
 		lsnr := resource.(*listener.Listener)
 		if lsnr.Name == name {
 			chain := w.newFilterChain(routeConfigName, secret, servernames)
 			lsnr.FilterChains = append(lsnr.FilterChains, chain)
+			break
+		}
+	}
+}
+
+func (w *Worker) DeleteListenerFilterChain(name string, routeConfigName string) {
+	for _, resource := range w.listeners {
+		lsnr := resource.(*listener.Listener)
+		if lsnr.Name == name {
+			chains := []*listener.FilterChain{}
+			for _, chain := range lsnr.FilterChains {
+				if chain.Name != routeConfigName {
+					chains = append(chains, chain)
+				}
+			}
+			lsnr.FilterChains = chains
 			break
 		}
 	}
@@ -355,6 +382,17 @@ func (w *Worker) UpdateCluster(name string, host string, port uint32) {
 	}
 }
 
+func (w *Worker) DeleteCluster(name string) {
+	clusters := []types.Resource{}
+	for _, resource := range w.clusters {
+		cluster := resource.(*cluster.Cluster)
+		if cluster.Name != name {
+			clusters = append(clusters, cluster)
+		}
+	}
+	w.clusters = clusters
+}
+
 func (w *Worker) newCluster(name string, host string, port uint32) *cluster.Cluster {
 	return &cluster.Cluster{
 		Name:              name,
@@ -409,6 +447,17 @@ func (w *Worker) UpdateRoute(routeConfigName string, name string, prefix string,
 	w.rebuildRoutes(routeConfigName)
 }
 
+func (w *Worker) DeleteRoute(routeConfigName string, name string) {
+	routes := []*route.Route{}
+	for _, r := range w.routeDetails[routeConfigName] {
+		if r.Name != name {
+			routes = append(routes, r)
+		}
+	}
+	w.routeDetails[routeConfigName] = routes
+	w.rebuildRoutes(routeConfigName)
+}
+
 func (w *Worker) AddRouteConfiguration(routeConfigName string, domains []string) {
 	if _, ok := w.routeDetails[routeConfigName]; ok {
 		log.Errorf("Route config %s already exists", routeConfigName)
@@ -438,6 +487,17 @@ func (w *Worker) UpdateRouteConfiguration(name string, domains []string) {
 			break
 		}
 	}
+}
+
+func (w *Worker) DeleteRouteConfiguration(name string) {
+	routes := []types.Resource{}
+	for _, resource := range w.routes {
+		rc := resource.(*route.RouteConfiguration)
+		if rc.Name != name {
+			routes = append(routes, rc)
+		}
+	}
+	w.routes = routes
 }
 
 func (w *Worker) GetRouteConfigurationNames() []string {
@@ -518,6 +578,17 @@ func (w *Worker) UpdateSecret(name string, keyPath string, certPath string, pass
 			break
 		}
 	}
+}
+
+func (w *Worker) DeleteSecret(name string) {
+	secrets := []types.Resource{}
+	for _, resource := range w.secrets {
+		sec := resource.(*secret.Secret)
+		if sec.Name != name {
+			secrets = append(secrets, sec)
+		}
+	}
+	w.secrets = secrets
 }
 
 func (w *Worker) GetSecretNames() []string {
