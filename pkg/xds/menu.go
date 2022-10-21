@@ -310,12 +310,31 @@ func addCluster(worker *Worker) error {
 		return err
 	}
 
-	worker.AddCluster(name, host, port)
+	tls, err := promptBool("Use TLS", (port == 8443 || port == 443))
+	if err != nil {
+		return err
+	}
+
+	mtlsSecret := ""
+	if tls {
+		mtls, err := promptBool("Use mTLS", false)
+		if err != nil {
+			return err
+		}
+
+		if mtls {
+			mtlsSecret, err = promptSecretSelection(worker)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	worker.AddCluster(name, host, port, tls, mtlsSecret)
 	return nil
 }
 
 func updateCluster(worker *Worker, name string) error {
-	hostname, port := worker.GetClusterDetails(name)
+	hostname, port, tls := worker.GetClusterDetails(name)
 	hostname, err := promptString("Cluster Port", hostname)
 	if err != nil {
 		return err
@@ -326,7 +345,27 @@ func updateCluster(worker *Worker, name string) error {
 		return err
 	}
 
-	worker.UpdateCluster(name, hostname, port)
+	tls, err = promptBool("Use TLS", tls)
+	if err != nil {
+		return err
+	}
+
+	mtlsSecret := ""
+	if tls {
+		mtls, err := promptBool("Use mTLS", false)
+		if err != nil {
+			return err
+		}
+
+		if mtls {
+			mtlsSecret, err = promptSecretSelection(worker)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	worker.UpdateCluster(name, hostname, port, tls, mtlsSecret)
 	return nil
 }
 

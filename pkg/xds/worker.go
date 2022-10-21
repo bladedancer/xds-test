@@ -339,15 +339,16 @@ func (w *Worker) GetClusterNames() []string {
 	return names
 }
 
-func (w *Worker) GetClusterDetails(name string) (string, uint32) {
+func (w *Worker) GetClusterDetails(name string) (string, uint32, bool) {
 	for _, resource := range w.clusters {
 		clst := resource.(*cluster.Cluster)
 		if clst.Name == name {
 			return clst.LoadAssignment.Endpoints[0].LbEndpoints[0].HostIdentifier.(*endpoint.LbEndpoint_Endpoint).Endpoint.Address.Address.(*core.Address_SocketAddress).SocketAddress.Address,
-				clst.LoadAssignment.Endpoints[0].LbEndpoints[0].HostIdentifier.(*endpoint.LbEndpoint_Endpoint).Endpoint.Address.Address.(*core.Address_SocketAddress).SocketAddress.PortSpecifier.(*core.SocketAddress_PortValue).PortValue
+				clst.LoadAssignment.Endpoints[0].LbEndpoints[0].HostIdentifier.(*endpoint.LbEndpoint_Endpoint).Endpoint.Address.Address.(*core.Address_SocketAddress).SocketAddress.PortSpecifier.(*core.SocketAddress_PortValue).PortValue,
+				(clst.TransportSocket != nil)
 		}
 	}
-	return "", 0
+	return "", 0, false
 }
 
 func (w *Worker) GetRouteNames(routeConfigName string) []string {
@@ -367,19 +368,23 @@ func (w *Worker) GetRouteDetails(routeConfigName string, name string) (string, s
 	return "", ""
 }
 
-func (w *Worker) AddCluster(name string, host string, port uint32) {
-	w.clusters = append(w.clusters, w.newCluster(name, host, port))
+func (w *Worker) AddCluster(name string, host string, port uint32, tls bool, mtlsSecret string) {
+	w.clusters = append(w.clusters, w.newCluster(name, host, port, tls, mtlsSecret))
 }
 
-func (w *Worker) UpdateCluster(name string, host string, port uint32) {
+func (w *Worker) UpdateCluster(name string, host string, port uint32, tls bool, mtlsSecret string) {
+	clusters := []types.Resource{}
+
 	for _, resource := range w.clusters {
 		clst := resource.(*cluster.Cluster)
 		if clst.Name == name {
-			clst.LoadAssignment.Endpoints[0].LbEndpoints[0].HostIdentifier.(*endpoint.LbEndpoint_Endpoint).Endpoint.Address.Address.(*core.Address_SocketAddress).SocketAddress.Address = host
-			clst.LoadAssignment.Endpoints[0].LbEndpoints[0].HostIdentifier.(*endpoint.LbEndpoint_Endpoint).Endpoint.Address.Address.(*core.Address_SocketAddress).SocketAddress.PortSpecifier = &core.SocketAddress_PortValue{PortValue: port}
-			break
+			// Easier to recreate it
+			clusters = append(clusters, w.newCluster(name, host, port, tls, mtlsSecret))
+		} else {
+			clusters = append(clusters, clst)
 		}
 	}
+	w.clusters = clusters
 }
 
 func (w *Worker) DeleteCluster(name string) {
@@ -393,13 +398,43 @@ func (w *Worker) DeleteCluster(name string) {
 	w.clusters = clusters
 }
 
-func (w *Worker) newCluster(name string, host string, port uint32) *cluster.Cluster {
+func (w *Worker) newCluster(name string, host string, port uint32, tls bool, mtlsSecretName string) *cluster.Cluster {
+	var transportSocket *core.TransportSocket = nil
+
+	if tls {
+		mtlsSds := []*secret.SdsSecretConfig{}
+		if mtlsSecretName != "" {
+			mtlsSds = []*secret.SdsSecretConfig{
+				{
+					Name: mtlsSecretName,
+					SdsConfig: &core.ConfigSource{
+						ResourceApiVersion:    core.ApiVersion_V3,
+						ConfigSourceSpecifier: &core.ConfigSource_Ads{},
+					},
+				},
+			}
+		}
+		upstreamTlsConfig, _ := anypb.New(&secret.UpstreamTlsContext{
+			CommonTlsContext: &secret.CommonTlsContext{
+				TlsCertificateSdsSecretConfigs: mtlsSds,
+			},
+		})
+
+		transportSocket = &core.TransportSocket{
+			Name: name,
+			ConfigType: &core.TransportSocket_TypedConfig{
+				TypedConfig: upstreamTlsConfig,
+			},
+		}
+	}
+
 	return &cluster.Cluster{
 		Name:              name,
 		WaitForWarmOnInit: &wrapperspb.BoolValue{Value: true},
 		ClusterDiscoveryType: &cluster.Cluster_Type{
 			Type: cluster.Cluster_STRICT_DNS,
 		},
+		TransportSocket: transportSocket,
 		DnsLookupFamily: cluster.Cluster_V4_ONLY,
 		LoadAssignment: &endpoint.ClusterLoadAssignment{
 			ClusterName: name,
