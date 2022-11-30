@@ -17,6 +17,7 @@ import (
 	secret "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	http_conn "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
@@ -33,11 +34,11 @@ type Worker struct {
 
 	snapshotCache cache.SnapshotCache
 
-	endpoints []types.Resource
-	clusters  []types.Resource
-	routes    []types.Resource
-	listeners []types.Resource
-	secrets   []types.Resource
+	endpoints []types.ResourceWithTTL
+	clusters  []types.ResourceWithTTL
+	routes    []types.ResourceWithTTL
+	listeners []types.ResourceWithTTL
+	secrets   []types.ResourceWithTTL
 
 	routeDetails map[string][]*route.Route // Keeping this separate to the route config
 
@@ -51,11 +52,11 @@ func NewWorker(snapshotCache cache.SnapshotCache, updateInterval uint) *Worker {
 		snapshotCache:  snapshotCache,
 		updateInterval: updateInterval,
 
-		endpoints: []types.Resource{},
-		clusters:  []types.Resource{},
-		routes:    []types.Resource{},
-		listeners: []types.Resource{},
-		secrets:   []types.Resource{},
+		endpoints: []types.ResourceWithTTL{},
+		clusters:  []types.ResourceWithTTL{},
+		routes:    []types.ResourceWithTTL{},
+		listeners: []types.ResourceWithTTL{},
+		secrets:   []types.ResourceWithTTL{},
 		dirty:     true,
 
 		routeDetails: map[string][]*route.Route{},
@@ -139,8 +140,8 @@ func (w *Worker) work(ctx context.Context) {
 		return
 	}
 	w.version = fmt.Sprintf("%d", time.Now().UnixNano())
-	snapshot, err := cache.NewSnapshot(w.version,
-		map[string][]types.Resource{
+	snapshot, err := cache.NewSnapshotWithTTLs(w.version,
+		map[string][]types.ResourceWithTTL{
 			resource.EndpointType: w.endpoints,
 			resource.ClusterType:  w.clusters,
 			resource.RouteType:    w.routes,
@@ -160,23 +161,28 @@ func (w *Worker) work(ctx context.Context) {
 }
 
 func (w *Worker) AddListener(name string, port uint32, secret string, servernames []string, routeConfigName string) {
-	w.listeners = append(w.listeners, w.newListener(name, port, secret, servernames, routeConfigName))
+	ttl := 120 * time.Second
+	listener := types.ResourceWithTTL{
+		Resource: w.newListener(name, port, secret, servernames, routeConfigName),
+		TTL:      &ttl,
+	}
+	w.listeners = append(w.listeners, listener)
 }
 
 func (w *Worker) DeleteListener(name string) {
-	listeners := []types.Resource{}
-	for _, resource := range w.listeners {
-		lsnr := resource.(*listener.Listener)
+	listeners := []types.ResourceWithTTL{}
+	for _, resourcettl := range w.listeners {
+		lsnr := resourcettl.Resource.(*listener.Listener)
 		if lsnr.Name != name {
-			listeners = append(listeners, lsnr)
+			listeners = append(listeners, resourcettl)
 		}
 	}
 	w.listeners = listeners
 }
 
 func (w *Worker) AddListenerFilterChain(name string, routeConfigName string, secret string, servernames []string) {
-	for _, resource := range w.listeners {
-		lsnr := resource.(*listener.Listener)
+	for _, resourcettl := range w.listeners {
+		lsnr := resourcettl.Resource.(*listener.Listener)
 		if lsnr.Name == name {
 			chain := w.newFilterChain(routeConfigName, secret, servernames)
 			lsnr.FilterChains = append(lsnr.FilterChains, chain)
@@ -186,8 +192,8 @@ func (w *Worker) AddListenerFilterChain(name string, routeConfigName string, sec
 }
 
 func (w *Worker) DeleteListenerFilterChain(name string, routeConfigName string) {
-	for _, resource := range w.listeners {
-		lsnr := resource.(*listener.Listener)
+	for _, resourcettl := range w.listeners {
+		lsnr := resourcettl.Resource.(*listener.Listener)
 		if lsnr.Name == name {
 			chains := []*listener.FilterChain{}
 			for _, chain := range lsnr.FilterChains {
@@ -202,8 +208,8 @@ func (w *Worker) DeleteListenerFilterChain(name string, routeConfigName string) 
 }
 
 func (w *Worker) UpdateListenerFilterChain(listenerName string, routeConfigName string, secret string, servernames []string) {
-	for _, resource := range w.listeners {
-		lsnr := resource.(*listener.Listener)
+	for _, resourcettl := range w.listeners {
+		lsnr := resourcettl.Resource.(*listener.Listener)
 		if lsnr.Name == listenerName {
 			filterChains := []*listener.FilterChain{}
 
@@ -223,8 +229,8 @@ func (w *Worker) UpdateListenerFilterChain(listenerName string, routeConfigName 
 
 func (w *Worker) GetListenerNames() []string {
 	names := []string{}
-	for _, resource := range w.listeners {
-		names = append(names, resource.(*listener.Listener).Name)
+	for _, resourcettl := range w.listeners {
+		names = append(names, resourcettl.Resource.(*listener.Listener).Name)
 	}
 	return names
 }
@@ -333,15 +339,15 @@ func (w *Worker) newFilterChain(routeCongName string, secretName string, servern
 
 func (w *Worker) GetClusterNames() []string {
 	names := []string{}
-	for _, resource := range w.clusters {
-		names = append(names, resource.(*cluster.Cluster).Name)
+	for _, resourcettl := range w.clusters {
+		names = append(names, resourcettl.Resource.(*cluster.Cluster).Name)
 	}
 	return names
 }
 
 func (w *Worker) GetClusterDetails(name string) (string, uint32, bool) {
-	for _, resource := range w.clusters {
-		clst := resource.(*cluster.Cluster)
+	for _, resourcettl := range w.clusters {
+		clst := resourcettl.Resource.(*cluster.Cluster)
 		if clst.Name == name {
 			return clst.LoadAssignment.Endpoints[0].LbEndpoints[0].HostIdentifier.(*endpoint.LbEndpoint_Endpoint).Endpoint.Address.Address.(*core.Address_SocketAddress).SocketAddress.Address,
 				clst.LoadAssignment.Endpoints[0].LbEndpoints[0].HostIdentifier.(*endpoint.LbEndpoint_Endpoint).Endpoint.Address.Address.(*core.Address_SocketAddress).SocketAddress.PortSpecifier.(*core.SocketAddress_PortValue).PortValue,
@@ -369,30 +375,40 @@ func (w *Worker) GetRouteDetails(routeConfigName string, name string) (string, s
 }
 
 func (w *Worker) AddCluster(name string, host string, port uint32, tls bool, mtlsSecret string) {
-	w.clusters = append(w.clusters, w.newCluster(name, host, port, tls, mtlsSecret))
+	ttl := 60 * time.Second
+	cluster := types.ResourceWithTTL{
+		Resource: w.newCluster(name, host, port, tls, mtlsSecret),
+		TTL:      &ttl,
+	}
+
+	w.clusters = append(w.clusters, cluster)
 }
 
 func (w *Worker) UpdateCluster(name string, host string, port uint32, tls bool, mtlsSecret string) {
-	clusters := []types.Resource{}
-
-	for _, resource := range w.clusters {
-		clst := resource.(*cluster.Cluster)
+	clusters := []types.ResourceWithTTL{}
+	ttl := 60 * time.Second
+	for _, resourcettl := range w.clusters {
+		clst := resourcettl.Resource.(*cluster.Cluster)
 		if clst.Name == name {
 			// Easier to recreate it
-			clusters = append(clusters, w.newCluster(name, host, port, tls, mtlsSecret))
+			cluster := types.ResourceWithTTL{
+				Resource: w.newCluster(name, host, port, tls, mtlsSecret),
+				TTL:      &ttl,
+			}
+			clusters = append(clusters, cluster)
 		} else {
-			clusters = append(clusters, clst)
+			clusters = append(clusters, resourcettl)
 		}
 	}
 	w.clusters = clusters
 }
 
 func (w *Worker) DeleteCluster(name string) {
-	clusters := []types.Resource{}
-	for _, resource := range w.clusters {
-		cluster := resource.(*cluster.Cluster)
+	clusters := []types.ResourceWithTTL{}
+	for _, resourcettl := range w.clusters {
+		cluster := resourcettl.Resource.(*cluster.Cluster)
 		if cluster.Name != name {
-			clusters = append(clusters, cluster)
+			clusters = append(clusters, resourcettl)
 		}
 	}
 	w.clusters = clusters
@@ -434,6 +450,7 @@ func (w *Worker) newCluster(name string, host string, port uint32, tls bool, mtl
 		ClusterDiscoveryType: &cluster.Cluster_Type{
 			Type: cluster.Cluster_STRICT_DNS,
 		},
+		ConnectTimeout:  &durationpb.Duration{Seconds: 5},
 		TransportSocket: transportSocket,
 		DnsLookupFamily: cluster.Cluster_V4_ONLY,
 		LoadAssignment: &endpoint.ClusterLoadAssignment{
@@ -511,12 +528,19 @@ func (w *Worker) AddRouteConfiguration(routeConfigName string, domains []string)
 			},
 		},
 	}
-	w.routes = append(w.routes, routecfg)
+
+	ttl := 50 * time.Second
+	routecfgttl := types.ResourceWithTTL{
+		Resource: routecfg,
+		TTL:      &ttl,
+	}
+
+	w.routes = append(w.routes, routecfgttl)
 }
 
 func (w *Worker) UpdateRouteConfiguration(name string, domains []string) {
-	for _, resource := range w.routes {
-		rc := resource.(*route.RouteConfiguration)
+	for _, resourcettl := range w.routes {
+		rc := resourcettl.Resource.(*route.RouteConfiguration)
 		if rc.Name == name {
 			rc.VirtualHosts[0].Domains = domains
 			break
@@ -525,11 +549,11 @@ func (w *Worker) UpdateRouteConfiguration(name string, domains []string) {
 }
 
 func (w *Worker) DeleteRouteConfiguration(name string) {
-	routes := []types.Resource{}
-	for _, resource := range w.routes {
-		rc := resource.(*route.RouteConfiguration)
+	routes := []types.ResourceWithTTL{}
+	for _, resourcettl := range w.routes {
+		rc := resourcettl.Resource.(*route.RouteConfiguration)
 		if rc.Name != name {
-			routes = append(routes, rc)
+			routes = append(routes, resourcettl)
 		}
 	}
 	w.routes = routes
@@ -537,8 +561,8 @@ func (w *Worker) DeleteRouteConfiguration(name string) {
 
 func (w *Worker) GetRouteConfigurationNames() []string {
 	names := []string{}
-	for _, resource := range w.routes {
-		rc := resource.(*route.RouteConfiguration)
+	for _, resourcettl := range w.routes {
+		rc := resourcettl.Resource.(*route.RouteConfiguration)
 		names = append(names, rc.Name)
 	}
 	return names
@@ -546,8 +570,8 @@ func (w *Worker) GetRouteConfigurationNames() []string {
 
 func (w *Worker) GetRouteConfigurationDetails(name string) []string {
 	domains := []string{}
-	for _, resource := range w.routes {
-		rc := resource.(*route.RouteConfiguration)
+	for _, resourcettl := range w.routes {
+		rc := resourcettl.Resource.(*route.RouteConfiguration)
 		if rc.Name == name {
 			domains = rc.VirtualHosts[0].Domains
 			break
@@ -557,8 +581,8 @@ func (w *Worker) GetRouteConfigurationDetails(name string) []string {
 }
 
 func (w *Worker) rebuildRoutes(name string) {
-	for _, resource := range w.routes {
-		rc := resource.(*route.RouteConfiguration)
+	for _, resourcettl := range w.routes {
+		rc := resourcettl.Resource.(*route.RouteConfiguration)
 		if rc.Name == name {
 			rc.VirtualHosts[0].Routes = w.routeDetails[name]
 			break
@@ -586,12 +610,17 @@ func (w *Worker) newRoute(name string, prefix string, cluster string) *route.Rou
 }
 
 func (w *Worker) AddSecret(name string, keyPath string, certPath string, password string) {
-	w.secrets = append(w.secrets, w.newSecret(name, keyPath, certPath, password))
+	ttl := 120 * time.Second
+	secret := types.ResourceWithTTL{
+		Resource: w.newSecret(name, keyPath, certPath, password),
+		TTL:      &ttl,
+	}
+	w.secrets = append(w.secrets, secret)
 }
 
 func (w *Worker) UpdateSecret(name string, keyPath string, certPath string, password string) {
-	for _, resource := range w.secrets {
-		sec := resource.(*secret.Secret)
+	for _, resourcettl := range w.secrets {
+		sec := resourcettl.Resource.(*secret.Secret)
 		if sec.Name == name {
 			sec.Type.(*secret.Secret_TlsCertificate).TlsCertificate = &secret.TlsCertificate{
 				CertificateChain: &core.DataSource{
@@ -616,11 +645,11 @@ func (w *Worker) UpdateSecret(name string, keyPath string, certPath string, pass
 }
 
 func (w *Worker) DeleteSecret(name string) {
-	secrets := []types.Resource{}
-	for _, resource := range w.secrets {
-		sec := resource.(*secret.Secret)
+	secrets := []types.ResourceWithTTL{}
+	for _, resourcettl := range w.secrets {
+		sec := resourcettl.Resource.(*secret.Secret)
 		if sec.Name != name {
-			secrets = append(secrets, sec)
+			secrets = append(secrets, resourcettl)
 		}
 	}
 	w.secrets = secrets
@@ -628,15 +657,15 @@ func (w *Worker) DeleteSecret(name string) {
 
 func (w *Worker) GetSecretNames() []string {
 	names := []string{}
-	for _, sec := range w.secrets {
-		names = append(names, sec.(*secret.Secret).Name)
+	for _, resourcettl := range w.secrets {
+		names = append(names, resourcettl.Resource.(*secret.Secret).Name)
 	}
 	return names
 }
 
 func (w *Worker) GetSecretDetails(name string) (string, string, string) {
-	for _, resource := range w.secrets {
-		sec := resource.(*secret.Secret)
+	for _, resourcettl := range w.secrets {
+		sec := resourcettl.Resource.(*secret.Secret)
 		if sec.Name == name {
 			return sec.GetTlsCertificate().GetPrivateKey().GetFilename(), sec.GetTlsCertificate().GetCertificateChain().GetFilename(), sec.GetTlsCertificate().Password.GetInlineString()
 		}
